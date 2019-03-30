@@ -1,37 +1,10 @@
-## Welcome to GitHub Pages
+## 计算机视觉
 
-You can use the [editor on GitHub](https://github.com/xinetzone/CV/edit/master/README.md) to maintain and preview the content for your website in Markdown files.
+本项目既是一个计算机视觉库同时也是一个计算机视觉学习资源库。本项目既会记录我的学习笔记与心得，同时也会将我动手实现的代码进行维护。同时也欢迎大家提供新的资源。
 
-Whenever you commit to this repository, GitHub Pages will run [Jekyll](https://jekyllrb.com/) to rebuild the pages in your site, from the content in your Markdown files.
+### 1 目标检测目录
 
-### Markdown
+- [ ] 完成 Faster RCNN 的学习与实现（2019/3/30-）
+- [ ] 完成 SSD 的学习与实现
 
-Markdown is a lightweight and easy-to-use syntax for styling your writing. It includes conventions for
-
-```markdown
-Syntax highlighted code block
-
-# Header 1
-## Header 2
-### Header 3
-
-- Bulleted
-- List
-
-1. Numbered
-2. List
-
-**Bold** and _Italic_ and `Code` text
-
-[Link](url) and ![Image](src)
-```
-
-For more details see [GitHub Flavored Markdown](https://guides.github.com/features/mastering-markdown/).
-
-### Jekyll Themes
-
-Your Pages site will use the layout and styles from the Jekyll theme you have selected in your [repository settings](https://github.com/xinetzone/CV/settings). The name of this theme is saved in the Jekyll `_config.yml` configuration file.
-
-### Support or Contact
-
-Having trouble with Pages? Check out our [documentation](https://help.github.com/categories/github-pages-basics/) or [contact support](https://github.com/contact) and we’ll help you sort it out.
+#### 1.1 Faster RCNN 学习笔记
