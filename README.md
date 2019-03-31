@@ -10,3 +10,5 @@
 - [ ] 完成 SSD 的学习与实现
 
 #### 1.1 Faster RCNN 学习笔记
+
+- [学习笔记](detection/faster_rcnn.md)
