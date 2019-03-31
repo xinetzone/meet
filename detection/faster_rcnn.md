@@ -475,7 +475,7 @@ plt.pcolor(x, y, x+y);  # x和y是网格,z是(x,y)坐标处的颜色值colorbar(
 ```python
 stride = 16  # 滑动的步长
 alloc_size = F.shape[2:]  # 特征图的尺寸
-A._generate_anchors(stride, alloc_size).shape
+anchors = A._generate_anchors(stride, alloc_size).shape
 ```
 
 输出结果：
@@ -484,4 +484,6 @@ A._generate_anchors(stride, alloc_size).shape
 (1, 1, 50, 50, 36)
 ```
 
-即总共 $50\times 50 \times 9=22500$ 个锚点。
+即总共 $50\times 50 \times 9=22500$ 个锚点（anchors 数量庞大且必然有许多的高度重叠的框。）。至此，我们生成初始锚框的过程便结束了，同时很容易发现，anchors 的生成仅仅借助 Numpy 便完成了，这样做十分有利于代码迁移到 Pytorch、TensorFlow 等支持 Numpy 作为输入的框架。下面仅仅考虑 MXNet，其他框架以后再讨论。
+
+回到本小节的 FCN 的讨论上来，作者
