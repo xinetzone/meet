@@ -304,3 +304,184 @@ A 与 B 的并集 271
 A 与 B 的 IoU 0.18081180811808117
 A 的中心、高、宽以及面积 (7.5, 7.5) 16 16 256
 ```
+
+考虑到代码的可复用性，将 `Box` 封装进入 app/detection/bbox.py 中。下面重新考虑 loader。首先定义一个转换函数：
+
+```python
+def getX(img):
+    # 将 img (h, w, 3) 转换为 (1, 3, w, h)
+    img = img.transpose((2, 1, 0))
+    return np.expand_dims(img, 0)
+```
+
+函数 `getX` 将图片由 (h, w, 3) 转换为 (1, 3, w, h)：
+
+```python
+img, label = loader[0]
+img = cv2.resize(img, (800, 800)) # resize 为 800 x 800
+X = getX(img)     # 转换为 (1, 3, w, h)
+img.shape, X.shape
+```
+
+输出结果：
+
+```sh
+((800, 800, 3), (1, 3, 800, 800))
+```
+
+与此同时，获取特征图的数据：
+
+```python
+features = net.features[:29]
+F = features(imgs)
+F.shape
+```
+
+输出：
+
+```sh
+(1, 512, 50, 50)
+```
+
+接着需要考虑如何将特征图 F 映射回原图？
+
+### 全卷积（FCN）：将特征图映射回原图
+
+faster R-CNN 中的 FCN 仅仅是有着 FCN 的特性，并不是真正意义上的卷积。faster R-CNN 仅仅是借用了 FCN 的思想来实现将特征图映射回原图的目的，同时将输出许多锚框。
+
+特征图上的 1 个像素点的感受野为 $16\times 16$，换言之，特征图上的锚点映射回原图的感受区域为 $16 \times 16$，论文称其为 reference box。下面相对于 reference box 依据不同的尺度与高宽比例来生成不同的锚框。
+
+```python
+base_size = 2**4  # 特征图的每个像素的感受野大小
+scales = [8, 16, 32]  # 锚框相对于 reference box 的尺度
+ratios = [0.5, 1, 2]  # reference box 与锚框的高宽的比率（aspect ratios）
+```
+
+其实 reference box 也对应于论文描述的 window（滑动窗口），这个之后再解释。我们先看看 scales 与 ratios 的具体含义。
+
+为了更加一般化，假设 reference box 图片高宽分别为 $h, w$，而锚框的高宽分别为 $h_1, w_1$，形式化 scales 与 ratios 为公式 1：
+
+$$
+\begin{cases}
+\frac{w_1 h_1}{wh} = s^2\\
+\frac{h_1}{w_1} = \frac{h}{w} r \Rightarrow \frac{h_1}{h} = \frac{w_1}{w} r
+\end{cases}
+$$
+
+可以将上式转换为公式 2：
+
+$$
+\begin{cases}
+\frac{w_1}{w} = \frac{s}{\sqrt{r}}\\
+\frac{h_1}{h} = \frac{w_1}{w} r = s \sqrt{r}
+\end{cases}
+$$
+
+同样可以转换为公式3：
+
+$$
+\begin{cases}
+w_s = \frac{w_1}{s} = \frac{w}{\sqrt{r}}\\
+h_s = \frac{h_1}{s} = h \sqrt{r}
+\end{cases}
+$$
+
+基于公式 2 与公式 3 均可以很容易计算出 $w_1,h_1$. 一般地，$w=h$，公式 3 亦可以转换为公式 4：
+
+$$
+\begin{cases}
+w_s = \sqrt{\frac{wh}{r}}\\
+h_s = w_s r
+\end{cases}
+$$
+
+gluoncv 结合公式 4 来编程，本文依据 3 进行编程。无论原图的尺寸如何，特征图的左上角第一个锚点映射回原图后的 reference box 的 bbox = (xmain, ymin, xmax, ymax) 均为 (0, 0, bas_size-1, base_size-1)，为了方便称呼，我们称其为 base_reference box。基于 base_reference box 依据不同的 s 与 r 的组合生成不同尺度和高宽比的锚框，且称其为 base_anchors。编程实现：
+
+```python
+class MultiBox(Box):
+    def __init__(self, base_size, ratios, scales):
+        if not base_size:
+            raise ValueError("Invalid base_size: {}.".format(base_size))
+        if not isinstance(ratios, (tuple, list)):
+            ratios = [ratios]
+        if not isinstance(scales, (tuple, list)):
+            scales = [scales]
+        super().__init__([0]*2+[base_size-1]*2)  # 特征图的每个像素的感受野大小为 base_size
+        # reference box 与锚框的高宽的比率（aspect ratios）
+        self._ratios = np.array(ratios)[:, None]
+        self._scales = np.array(scales)     # 锚框相对于 reference box 的尺度
+
+    @property
+    def base_anchors(self):
+        ws = np.round(self.w / np.sqrt(self._ratios))
+        w = ws * self._scales
+        h = w * self._ratios
+        wh = np.stack([w.flatten(), h.flatten()], axis=1)
+        wh = (wh - 1) * .5
+        return np.concatenate([self.whctrs - wh, self.whctrs + wh], axis=1)
+
+    def _generate_anchors(self, stride, alloc_size):
+        # propagete to all locations by shifting offsets
+        height, width = alloc_size  # 特征图的尺寸
+        offset_x = np.arange(0, width * stride, stride)
+        offset_y = np.arange(0, height * stride, stride)
+        offset_x, offset_y = np.meshgrid(offset_x, offset_y)
+        offsets = np.stack((offset_x.ravel(), offset_y.ravel(),
+                            offset_x.ravel(), offset_y.ravel()), axis=1)
+        # broadcast_add (1, N, 4) + (M, 1, 4)
+        anchors = (self.base_anchors.reshape(
+            (1, -1, 4)) + offsets.reshape((-1, 1, 4)))
+        anchors = anchors.reshape((1, 1, height, width, -1)).astype(np.float32)
+        return anchors
+```
+
+下面看看具体效果：
+
+```python
+base_size = 2**4  # 特征图的每个像素的感受野大小
+scales = [8, 16, 32]  # 锚框相对于 reference box 的尺度
+ratios = [0.5, 1, 2]  # reference box 与锚框的高宽的比率（aspect ratios）
+A = MultiBox(base_size,ratios, scales)
+A.base_anchors
+```
+
+输出结果：
+
+```python
+array([[ -84.,  -38.,   99.,   53.],
+       [-176.,  -84.,  191.,   99.],
+       [-360., -176.,  375.,  191.],
+       [ -56.,  -56.,   71.,   71.],
+       [-120., -120.,  135.,  135.],
+       [-248., -248.,  263.,  263.],
+       [ -36.,  -80.,   51.,   95.],
+       [ -80., -168.,   95.,  183.],
+       [-168., -344.,  183.,  359.]])
+```
+
+接着考虑将 base_anchors 在整个原图上进行滑动。比如，特征图的尺寸为 (5， 5) 而感受野的大小为 50，则 base_reference box 在原图滑动的情况（移动步长为 50）如下图：
+
+```python
+x, y = np.mgrid[0:300:50, 0:300:50]
+plt.pcolor(x, y, x+y);  # x和y是网格,z是(x,y)坐标处的颜色值colorbar()
+```
+
+输出结果：
+
+![](../images/grid.png)
+
+原图被划分为了 25 个 block，每个 block 均代表一个 reference box。若 base_anchors 有 9 个，则只需要按照 stride = 50 进行滑动便可以获得这 25 个 block 的所有锚框（总计 5x5x9=225 个）。针对前面的特征图 F 有：
+
+```python
+stride = 16  # 滑动的步长
+alloc_size = F.shape[2:]  # 特征图的尺寸
+A._generate_anchors(stride, alloc_size).shape
+```
+
+输出结果：
+
+```sh
+(1, 1, 50, 50, 36)
+```
+
+即总共 $50\times 50 \times 9=22500$ 个锚点。
