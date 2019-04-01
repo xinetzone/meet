@@ -15,7 +15,7 @@ Faster R-CNN 主要分为两个部分：
 - Input：任意尺寸的图像
 - Output：一组带有目标得分的目标矩形 proposals
 
-为了生成 region proposals，在基网络的最后一个卷积层 `x` 上滑动一个小网络。该小网络由一个 $3\times 3$ 卷积 `conv1` 和一对兄弟卷积（并行的）$1\times 1$ 卷积 `reg` 和 `cls` 组成。其中，`conv1` 的参数 `padding=1`，`stride=1` 以保证其不会改变输出的特征图的尺寸。`reg` 作为 box-regression 用来编码 box 的坐标，`cls` 作为 box-classifaction 用来编码每个 proposal 是目标的概率。详细内容见我的博客：[我的目标检测笔记](https://www.cnblogs.com/q735613050/p/10573794.html)。论文中把不同 scale 和 aspect ratio 的 $k$ 个 reference boxes（参数化的 proposal） 称作 **anchors**（锚点）。锚点是滑块的中心。
+为了生成 region proposals，在基网络的最后一个卷积层 `x` 上滑动一个小网络。该小网络由一个 $3\times 3$ 卷积 `conv1` 和一对兄弟卷积（并行的）$1\times 1$ 卷积 `loc` 和 `score` 组成。其中，`conv1` 的参数 `padding=1`，`stride=1` 以保证其不会改变输出的特征图的尺寸。`loc` 作为 box-regression 用来编码 box 的坐标，`score` 作为 box-classifaction 用来编码每个 proposal 是目标的概率。详细内容见我的博客：[我的目标检测笔记](https://www.cnblogs.com/q735613050/p/10573794.html)。论文中把不同 scale 和 aspect ratio 的 $k$ 个 reference boxes（参数化的 proposal） 称作 **anchors**（锚点）。锚点是滑块的中心。
 
 为了更好的理解 anchors，下面以 Python 来展示其内涵。
 
@@ -345,7 +345,7 @@ F.shape
 
 接着需要考虑如何将特征图 F 映射回原图？
 
-### 全卷积（FCN）：将特征图映射回原图
+### 全卷积（FCN）：将锚点映射回原图
 
 faster R-CNN 中的 FCN 仅仅是有着 FCN 的特性，并不是真正意义上的卷积。faster R-CNN 仅仅是借用了 FCN 的思想来实现将特征图映射回原图的目的，同时将输出许多锚框。
 
@@ -484,6 +484,390 @@ anchors = A._generate_anchors(stride, alloc_size).shape
 (1, 1, 50, 50, 36)
 ```
 
-即总共 $50\times 50 \times 9=22500$ 个锚点（anchors 数量庞大且必然有许多的高度重叠的框。）。至此，我们生成初始锚框的过程便结束了，同时很容易发现，anchors 的生成仅仅借助 Numpy 便完成了，这样做十分有利于代码迁移到 Pytorch、TensorFlow 等支持 Numpy 作为输入的框架。下面仅仅考虑 MXNet，其他框架以后再讨论。
+即总共 $50\times 50 \times 9=22500$ 个锚点（anchors 数量庞大且必然有许多的高度重叠的框。）。至此，我们生成初始锚框的过程便结束了，同时很容易发现，anchors 的生成仅仅借助 Numpy 便完成了，这样做十分有利于代码迁移到 Pytorch、TensorFlow 等支持 Numpy 作为输入的框架。下面仅仅考虑 MXNet，其他框架以后再讨论。下面先看看 MultiBox 的设计对于使用 MXNet 进行后续的开发有什么好处吧！
 
-回到本小节的 FCN 的讨论上来，作者
+由于 base-net （基网络）的结构一经确定便是是固定的，针对不同尺寸的图片，如果每次生成 anchors 都要重新调用 A._generate_anchors() 一次，那么将会产生很多的不必要的冗余计算，gluoncv 提供了一种十分不错的思路：先生成 base_anchors，然后选择一个比较大的尺度 alloc_size（比如 $128\times 128$）用来生成锚框的初选模板；接着把真正的特征图传入到 RPNAnchorGenerator 并通过前向传播计算得到特征图的锚框。具体的操作细节见如下代码：
+
+```python
+class RPNAnchorGenerator(gluon.HybridBlock):
+    r"""生成 RPN 的锚框
+
+    参数
+    ----------
+    stride : int
+        特征图相对于原图的滑动步长，或是说是特征图上单个像素点的感受野。
+    base_size : int
+        reference anchor box 的宽或者高
+    ratios : iterable of float
+        anchor boxes 的 aspect ratios（高宽比）。我们期望它是 tuple 或者 list
+    scales : iterable of float
+        锚框相对于 reference anchor boxes 的尺度
+        采用如下形式计算锚框的高和宽:
+
+        .. math::
+
+            width_{anchor} = size_{base} \times scale \times \sqrt{ 1 / ratio}
+            height_{anchor} = width_{anchor} \times ratio
+
+    alloc_size : tuple of int
+        预设锚框的尺寸为 (H, W)，通常用来生成比较大的特征图（如 128x128）。
+        在推断的后期, 我们可以有可变的输入大小, 在这个时候, 我们可以从这个大的 anchor map 中直接裁剪出对应的 anchors, 以便我们可以避免在每次输入都要重新生成锚点。
+    """
+
+    def __init__(self, alloc_size, base_size, ratios, scales, **kwargs):
+        super().__init__(**kwargs)
+        # 生成锚框初选模板，之后通过切片获取特征图的真正锚框
+        anchors = MultiBox(base_size, ratios, scales)._generate_anchors(
+            base_size, alloc_size)
+        self.anchors = self.params.get_constant('anchor_', anchors)
+
+    # pylint: disable=arguments-differ
+    def hybrid_forward(self, F, x, anchors):
+        """Slice anchors given the input image shape.
+
+        Inputs:
+            - **x**: input tensor with (1 x C x H x W) shape.
+        Outputs:
+            - **out**: output anchor with (1, N, 4) shape. N is the number of anchors.
+
+        """
+        a = F.slice_like(anchors, x * 0, axes=(2, 3))
+        return a.reshape((1, -1, 4))
+```
+
+上面的 RPNAnchorGenerator 直接改写自 gluoncv。看看 RPNAnchorGenerator 的魅力所在：
+
+```python
+base_size = 2**4  # 特征图的每个像素的感受野大小
+scales = [8, 16, 32]  # 锚框相对于 reference box 的尺度
+ratios = [0.5, 1, 2]  # reference box 与锚框的高宽的比率（aspect ratios）
+stride = base_size  # 在原图上滑动的步长
+alloc_size = (128, 128)  # 一个比较大的特征图的锚框生成模板
+# 调用 RPNAnchorGenerator 生成 anchors
+A = RPNAnchorGenerator(alloc_size, base_size, ratios, scales)
+A.initialize()
+A(F)  # 直接传入特征图 F，获取 F 的 anchors
+```
+
+输出结果：
+
+```sh
+[[[ -84.  -38.   99.   53.]
+  [-176.  -84.  191.   99.]
+  [-360. -176.  375.  191.]
+  ...
+  [ 748.  704.  835.  879.]
+  [ 704.  616.  879.  967.]
+  [ 616.  440.  967. 1143.]]]
+<NDArray 1x22500x4 @cpu(0)>
+```
+
+shape = 1x22500x4 符合我们的预期。如果我们更改特征图的尺寸：
+
+```python
+x = nd.zeros((1, 3, 75, 45))
+A(x).shape
+```
+
+输出结果：
+
+```python
+(1, 30375, 4)
+```
+
+这里 $30375 = 75 \times 45 \times 9$ 也符合我们的预期。
+
+至此，我们完成了将特征图上的所有锚点映射回原图生成锚框的工作！
+
+## 平移不变性的锚点
+
+反观上述的编程实现，很容易便可理解论文提到的锚点的平移不变性。无论是锚点的生成还是锚框的生成都是基于 base_reference box 进行平移和卷积运算（亦可看作是一种线性变换）的。为了叙述方便下文将 RPNAnchorGenerator（被放置在 app/detection/anchor.py） 生成的 anchor boxes 由 corner（记作 $A$ 坐标形式：(xmin,ymin,xmax,ymax)）转换为 center（形式为：(xctr,yctr,w,h)）后的锚框记作 $B$。其中(xmin,ymin),(xmax,ymax) 分别表示锚框的最小值与最大值坐标；(xctr,yctr) 表示锚框的中心坐标，w,h 表示锚框的宽和高。且记 $a = (x_a,y_a,w_a,h_a) \in B$，即使用下标 $a$ 来标识锚框。$A$ 与 $B$ 是锚框的两种不同的表示形式。
+
+在 `gluoncv.nn.bbox` 中提供了将 $A$ 转换为 $B$ 的模块：`BBoxCornerToCenter`。下面便利用其进行编程。先载入环境：
+
+```python
+cd ../app/
+```
+
+接着载入本小节所需的包：
+
+```python
+from mxnet import init, gluon, autograd
+from mxnet.gluon import nn
+from gluoncv.nn.bbox import BBoxCornerToCenter
+# 自定义包
+from detection.bbox import MultiBox
+from detection.anchor import RPNAnchorGenerator
+```
+
+为了更加容易理解 $A$ 与 $B$ 的处理过程，下面先自创一个类(之后会抛弃)：
+
+```python
+class RPNProposal(nn.HybridBlock):
+    def __init__(self, channels, stride, base_size, ratios, scales, alloc_size, **kwargs):
+        super().__init__(**kwargs)
+        weight_initializer = init.Normal(0.01)
+
+        with self.name_scope():
+            self.anchor_generator = RPNAnchorGenerator(
+                stride, base_size, ratios, scales, alloc_size)
+            anchor_depth = self.anchor_generator.num_depth
+            # conv1 的创建
+            self.conv1 = nn.HybridSequential()
+            self.conv1.add(nn.Conv2D(channels, 3, 1, 1,
+                                     weight_initializer=weight_initializer))
+            self.conv1.add(nn.Activation('relu'))
+            # score 的创建
+            # use sigmoid instead of softmax, reduce channel numbers
+            self.score = nn.Conv2D(anchor_depth, 1, 1, 0,
+                                   weight_initializer=weight_initializer)
+            # loc 的创建
+            self.loc = nn.Conv2D(anchor_depth * 4, 1, 1, 0,
+                                 weight_initializer=weight_initializer)
+# 具体的操作如下
+channels = 256
+base_size = 2**4  # 特征图的每个像素的感受野大小
+scales = [8, 16, 32]  # 锚框相对于 reference box 的尺度
+ratios = [0.5, 1, 2]  # reference box 与锚框的高宽的比率（aspect ratios）
+stride = base_size  # 在原图上滑动的步长
+alloc_size = (128, 128)  # 一个比较大的特征图的锚框生成模板
+alloc_size = (128, 128)  # 一个比较大的特征图的锚框生成模板
+self = RPNProposal(channels, stride, base_size, ratios, scales, alloc_size)
+self.initialize()
+```
+
+下面我们便可以看看如何将 $A$ 转换为 $B$：
+
+```python
+img, label = loader[0]  # 载入图片和标注信息
+img = cv2.resize(img, (800, 800))  # resize 为 (800，800)
+imgs = nd.array(getX(img))  # 转换为 MXNet 的输入形式
+xs = features(imgs)        # 获取特征图张量
+F = nd
+A = self.anchor_generator(xs)    # (xmin,ymin,xmax,ymax) 形式的锚框
+box_to_center = BBoxCornerToCenter()  
+B = box_to_center(A)      # (x,y,w,h) 形式的锚框
+```
+
+### 边界框回归
+
+手动设计的锚框 $B$ 并不能很好的满足后续的 Fast R-CNN 的检测工作，还需要借助论文介绍的 3 个卷积层：conv1、score、loc。对于论文中的 $3 \times 3$ 的卷积核 conv1 我的理解是**模拟锚框的生成过程：通过不改变原图尺寸的卷积运算达到降维的目标，同时有着在原图滑动尺寸为 base_size 的 reference box 的作用**。换言之，**conv1 的作用是模拟生成锚点**。假设通过 RPN 生成的边界框 bbox 记为 $G=\{p:(x,y,w,h)\}$，利用 $1\times 1$ 卷积核 loc 预测 $p$ 相对于每个像素点（即锚点）所生成的 $k$ 个锚框的中心坐标与高宽的**偏移量**，利用 $1\times 1$ 卷积核 score 判别锚框是目标（objectness, foreground）还是背景（background）。记真实的边界框集合为 $G^* = \{p^*：(x^*,y^*,w^*,h^*)\}$。其中，$(x,y), (x^*,y^*)$ 分别代表预测边界框、真实边界框的中心坐标；$(w, h)， (w^*, h^*)$ 分别代表预测边界框、真实边界框的的宽与高。论文在 Training RPNs 中提到，在训练阶段 conv1、loc、score 使用均值为 $0$，标准差为 $0.01$ 的高斯分布来随机初始化。
+接着，看看如何使用 conv1、loc、score：
+
+```python
+x = self.conv1(xs)
+# score 的输出
+raw_rpn_scores = self.score(x).transpose(axes=(0, 2, 3, 1)).reshape((0, -1,1))
+rpn_scores = F.sigmoid(F.stop_gradient(raw_rpn_scores)) # 转换为概率形式
+# loc 的输出
+rpn_box_pred = self.loc(x).transpose(axes=(0, 2, 3, 1)).reshape((0, -1, 4))
+```
+
+卷积核 loc 的作用是用来学习偏移量的，在论文中给出了如下公式：
+
+$$
+\begin{cases}
+t_x = \frac{x - x_a}{w_a} & t_y = \frac{y - y_a}{h_a}\\
+t_x^* = \frac{x^* - x_a}{w_a} & t_y^* = \frac{y^* - y_a}{h_a}\\
+t_w = \log(\frac{w}{w_a}) & t_h = \log(\frac{h}{h_a})\\
+t_w^* = \log(\frac{w^*}{w_a}) & t_h^* = \log(\frac{h^*}{h_a})
+\end{cases}
+$$
+
+这样可以很好的消除图像尺寸的不同带来的影响。为了使得修正后的锚框 G 具备与真实边界框 $G^*$ 有相同的均值和标准差，还需要设定：$\sigma = (\sigma_x, \sigma_y, \sigma_w, \sigma_h), \mu = (\mu_x,\mu_y,\mu_w,\mu_h)$ 表示 G 的 (x, y, w, h) 对应的标准差与均值。故而，为了让预测的边界框的的偏移量的分布更加均匀还需要将坐标转换一下：
+
+$$
+\begin{cases}
+t_x = \frac{\frac{x - x_a}{w_a} - \mu_x}{\sigma_x}\\
+t_y = \frac{\frac{y - y_a}{h_a} - \mu_y}{\sigma_y}\\
+t_w = \frac{\log(\frac{w}{w_a}) - \mu_w}{\sigma_w}\\
+t_h = \frac{\log(\frac{h}{h_a}) - \mu_h}{\sigma_h}
+\end{cases}
+$$
+
+对于 $G^*$ 也是一样的操作。（略去）一般地，$\sigma = (0.1, 0.1, 0.2, 0.2), \mu = (0, 0, 0, 0)$。
+
+由于 loc 的输出便是 $\{(t_x, t_y, t_w, t_h)\}$，下面我们需要反推 $(x, y, w, h)$：
+
+$$
+\begin{cases}
+x = (t_x\sigma_x +\mu_x)w_a + x_a\\
+y = (t_y\sigma_y +\mu_x)h_a + y_a\\
+w = w_a e^{t_w\sigma_w + \mu_w}\\
+h = h_a e^{t_h\sigma_h + \mu_h}
+\end{cases}
+$$
+
+通常情况下，$A$ 形式的边界框转换为 $B$ 形式的边界框被称为**编码**（encode），反之，则称为**解码**（decode）。在 `gluoncv.nn.coder` 中的 `NormalizedBoxCenterDecoder` 类实现了上述的转换过程，同时也完成了 $G$ 解码工作。
+
+```python
+from gluoncv.nn.coder import NormalizedBoxCenterDecoder
+stds = (0.1, 0.1, 0.2, 0.2)
+means = (0., 0., 0., 0.)
+box_decoder = NormalizedBoxCenterDecoder(stds, means)
+roi = box_decoder(rpn_box_pred, B)  # 解码后的 G
+```
+
+### 裁剪预测边界框超出原图边界的边界
+
+为了保持一致性，需要重写 `getX`：
+
+```python
+def getX(img):
+    # 将 img (h, w, 3) 转换为 (1, 3, h, w)
+    img = img.transpose((2, 0, 1))
+    return np.expand_dims(img, 0)
+```
+
+考虑到 RPN 的输入可以是批量数据：
+
+```python
+imgs = []
+labels = []
+for img, label in loader:
+    img = cv2.resize(img, (600, 800))  # resize 宽高为 (600，800)
+    imgs.append(getX(img))
+    labels.append(label)
+imgs = nd.array(np.concatenate(imgs)) # 一个批量的图片
+labels = nd.array(np.stack(labels))  # 一个批量的标注信息
+```
+
+这样便有：
+
+```python
+from gluoncv.nn.coder import NormalizedBoxCenterDecoder
+from gluoncv.nn.bbox import BBoxCornerToCenter
+stds = (0.1, 0.1, 0.2, 0.2)
+means = (0., 0., 0., 0.)
+
+fs = features(imgs)        # 获取特征图张量
+F = nd
+A = self.anchor_generator(fs)    # (xmin,ymin,xmax,ymax) 形式的锚框
+box_to_center = BBoxCornerToCenter()  
+B = box_to_center(A)      # (x,y,w,h) 形式的锚框
+x = self.conv1(fs)    # conv1 卷积
+raw_rpn_scores = self.score(x).transpose(axes=(0, 2, 3, 1)).reshape((0, -1,1))  # 激活之前的 score
+rpn_scores = F.sigmoid(F.stop_gradient(raw_rpn_scores))    # 激活后的 score
+rpn_box_pred = self.loc(x).transpose(axes=(0, 2, 3, 1)).reshape((0, -1, 4))  # loc 预测偏移量 (tx,ty,tw,yh)
+box_decoder = NormalizedBoxCenterDecoder(stds, means)
+roi = box_decoder(rpn_box_pred, B)  # 解码后的 G
+print(roi.shape)
+```
+
+此时，便有两张图片的预测 G：
+
+```sh
+(2, 16650, 4)
+```
+
+因为此时生成的 RoI 有许多超出边界的框，所以，需要进行裁减操作。先裁剪掉所有小于 $0$ 的边界：
+
+```python
+x = F.maximum(roi, 0.0)
+```
+
+`nd.maximum(x)` 的作用是 $\max\{0, x\}$。接下来裁剪掉大于原图的边界的边界：
+
+```python
+shape = F.shape_array(imgs)  # imgs 的 shape
+size = shape.slice_axis(axis=0, begin=2, end=None)  # imgs 的尺寸
+window = size.expand_dims(0)
+window
+```
+
+输出结果：
+
+```python
+[[800 600]]
+<NDArray 1x2 @cpu(0)>
+```
+
+此时是 (高, 宽) 的形式，而锚框的是以  (宽, 高) 的形式生成的，故而还需要：
+
+```python
+F.reverse(window, axis=1)
+```
+
+结果：
+
+```python
+[[600 800]]
+<NDArray 1x2 @cpu(0)>
+```
+
+因而，下面的 `m` 可以用来判断是否超出边界：
+
+```python
+m = F.tile(F.reverse(window, axis=1), reps=(2,)).reshape((0, -4, 1, -1))
+m
+```
+
+结果：
+
+```python
+[[[600 800 600 800]]]
+<NDArray 1x1x4 @cpu(0)>
+```
+
+接着，便可以获取裁剪之后的 RoI：
+
+```python
+roi = F.broadcast_minimum(x, F.cast(m, dtype='float32'))
+```
+
+整个裁剪工作可以通过如下操作简单实现：
+
+```python
+from gluoncv.nn.bbox import BBoxClipToImage
+clipper = BBoxClipToImage()
+roi = clipper(roi, imgs)  # 裁剪超出边界的边界
+```
+
+### 移除小于 min_size 的边界框
+
+移除小于 min_size 的边界框进一步筛选边界框：
+
+```python
+min_size = 5  # 最小锚框的尺寸
+xmin, ymin, xmax, ymax = roi.split(axis=-1, num_outputs=4) # 拆分坐标
+width = xmax - xmin  # 锚框宽度的集合
+height = ymax - ymin  # # 锚框高度的集合
+invalid = (width < min_size) + (height < min_size) # 所有小于 min_size 的高宽
+```
+
+由于张量的 `<` 运算有一个特性：满足条件的设置为 `1`，否则为 `0`。这样一来两个这样的运算相加便可筛选出同时不满足条件的对象：
+
+```python
+cond = invalid[0,:10]
+cond.T
+```
+
+结果：
+
+```python
+[[1. 0. 0. 0. 1. 0. 1. 1. 0. 2.]]
+<NDArray 1x10 @cpu(0)>
+```
+
+可以看出有 `2` 存在，代表着两个条件都满足，我们可以做筛选如下：
+
+```python
+F.where(cond, F.ones_like(cond)* -1, rpn_scores[0,:10]).T
+```
+
+结果：
+
+```python
+[[-1. 0.999997 0.0511509 0.9994136  -1.  0.00826993 -1.   -1. 0.99783903 -1.]]
+<NDArray 1x10 @cpu(0)>
+```
+
+由此可以筛选出所有不满足条件的对象。更进一步，筛选出所有不满足条件的对象：
+
+```python
+score = F.where(invalid, F.ones_like(invalid) * -1, rpn_scores)  # 筛选 score
+invalid = F.repeat(invalid, axis=-1, repeats=4)
+roi = F.where(invalid, F.ones_like(invalid) * -1, roi)  # 筛选 RoI
+```
+
+## NMS

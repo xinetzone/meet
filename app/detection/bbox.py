@@ -73,7 +73,7 @@ class Box:
         return I / U
 
 class MultiBox(Box):
-    def __init__(self, base_size, ratios, scales):
+    def __init__(self, stride, base_size, ratios, scales, alloc_size):
         if not base_size:
             raise ValueError("Invalid base_size: {}.".format(base_size))
         if not isinstance(ratios, (tuple, list)):
@@ -81,6 +81,10 @@ class MultiBox(Box):
         if not isinstance(scales, (tuple, list)):
             scales = [scales]
         super().__init__([0]*2+[base_size-1]*2)  # 特征图的每个像素的感受野大小为 base_size
+        # Number of anchors at each pixel
+        self.num_depth = len(ratios) * len(scales)
+        self._alloc_size = alloc_size
+        self._stride = stride
         # reference box 与锚框的高宽的比率（aspect ratios）
         self._ratios = np.array(ratios)[:, None]
         self._scales = np.array(scales)     # 锚框相对于 reference box 的尺度
@@ -94,11 +98,12 @@ class MultiBox(Box):
         wh = (wh - 1) * .5
         return np.concatenate([self.whctrs - wh, self.whctrs + wh], axis=1)
 
-    def _generate_anchors(self, stride, alloc_size):
+    @property
+    def anchors(self):
         # propagete to all locations by shifting offsets
-        height, width = alloc_size  # 特征图的尺寸
-        offset_x = np.arange(0, width * stride, stride)
-        offset_y = np.arange(0, height * stride, stride)
+        height, width = self._alloc_size  # 特征图的尺寸
+        offset_x = np.arange(0, width * self._stride, self._stride)
+        offset_y = np.arange(0, height * self._stride, self._stride)
         offset_x, offset_y = np.meshgrid(offset_x, offset_y)
         offsets = np.stack((offset_x.ravel(), offset_y.ravel(),
                             offset_x.ravel(), offset_y.ravel()), axis=1)
