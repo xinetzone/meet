@@ -205,10 +205,9 @@ $$
 ```python
 import numpy as np
 
-
 class Box:
     '''
-    corner: (xmin,ymin,xmax,ymax)
+    corner: Numpy, List, Tuple, MXNet.nd, rotch.tensor
     '''
 
     def __init__(self, corner):
@@ -248,6 +247,7 @@ class Box:
         '''
         计算 bbox 的 中心坐标
         '''
+        assert isinstance(self.w, (int, float)), 'need int or float'
         xctr = self.corner[0] + (self.w - 1) * .5
         yctr = self.corner[1] + (self.h - 1) * .5
         return xctr, yctr
@@ -256,26 +256,37 @@ class Box:
         '''
         运算符：&，实现两个 box 的交集运算
         '''
-        U = np.array([self.corner, other.corner])
-        xmin, ymin, xmax, ymax = np.split(U, 4, axis=1)
-        w = xmax.min() - xmin.max()
-        h = ymax.min() - ymin.max()
-        return w * h
+        xmin = max(self.corner[0], other.corner[0])  # xmin 中的大者
+        xmax = min(self.corner[2], other.corner[2])  # xmax 中的小者
+        ymin = max(self.corner[1], other.corner[1])  # ymin 中的大者
+        ymax = min(self.corner[3], other.corner[3])  # ymax 中的小者
+        w = xmax - xmin
+        h = ymax - ymin
+        if w < 0 or h < 0: # 两个边界框没有交集
+            return 0
+        else:  
+            return w * h
 
     def __or__(self, other):
         '''
         运算符：|，实现两个 box 的并集运算
         '''
         I = self & other
-        return self.area + other.area - I
+        if I == 0:
+            return 0
+        else:
+            return self.area + other.area - I
 
     def IoU(self, other):
         '''
         计算 IoU
         '''
         I = self & other
-        U = self | other
-        return I / U
+        if I == 0:
+            return 0
+        else:
+            U = self | other
+            return I / U
 ```
 
 类 Box 实现了 bbox 的交集、并集运算以及 IoU 的计算。下面举一个例子来说明：
@@ -870,4 +881,37 @@ invalid = F.repeat(invalid, axis=-1, repeats=4)
 roi = F.where(invalid, F.ones_like(invalid) * -1, roi)  # 筛选 RoI
 ```
 
-## NMS
+## NMS (Non-maximum suppression)
+
+我们先总结 RPN 的前期工作中 Proposal 的生成阶段：
+
+1. 利用 base_net 获取原图 $I$ 对应的特征图 $X$；
+2. 依据 base_net 的网络结构计算特征图的感受野大小为 base_size；
+3. 依据不同的 scale 和 aspect ratio 通过 MultiBox 计算特征图 $X$ 在 $(0,0)$ 位置的锚点对应的 $k$ 个锚框 base_anchors；
+4. 通过 RPNAnchorGenerator 将 $X$ 映射回原图并生成 corner 格式 (xmin,ymin,xmax,ymax) 的锚框 $A$；
+5. 将锚框 $A$ 转换为  center 格式 $(x,y,w,h)$，记作 $B$；
+6. $X$ 通过卷积 conv1 获得模拟锚点，亦称之为 rpn_features；
+7. 通过卷积层 score 获取 rpn_features 的得分 rpn_score；
+8. 与 7 并行的通过卷积层 loc 获取 rpn_features 的边界框回归的偏移量 rpn_box_pred；
+9. 依据 rpn_box_pred 修正锚框 $B$ 并将其解码为 $G$；
+10. 裁剪掉 $G$ 的超出原图尺寸的边界，并移除小于 min_size 的边界框。
+
+虽然上面的步骤移除了许多无效的边界并裁剪掉超出原图尺寸的边界，但是，可以想象到 $G$ 中必然存在许多的高度重叠的边界框，此时若将 $G$ 当作 Region Proposal 送入 PoI Pooling 层将给计算机带来十分庞大的负载，并且 $G$ 中的背景框远远多于目标极为不利于模型的训练。论文中给出了 NMS 的策略来解决上述难题。根据我们预测的  rpn_score，对 G 进行非极大值抑制操作（NMS），去除得分较低以及重复区域的 RoI。在 MXNet 提供了 `nd.contrib.box_nms` 来实现此次目标：
+
+```python
+nms_thresh = 0.7
+n_train_pre_nms = 12000  # 训练时 nms 之前的 bbox 的数目
+n_train_post_nms = 2000  # 训练时 nms 之后的 bbox 的数目
+n_test_pre_nms = 6000   # 测试时 nms 之前的 bbox 的数目
+n_test_post_nms = 300   # 测试时 nms 之后的 bbox 的数目
+
+pre = F.concat(scores, rois, dim=-1)  # 合并 score 与 roi
+# 非极大值抑制
+tmp = F.contrib.box_nms(pre, overlap_thresh=nms_thresh, topk=n_train_pre_nms,
+                        coord_start=1, score_index=0, id_index=-1, force_suppress=True)
+
+# slice post_nms number of boxes
+result = F.slice_axis(tmp, axis=1, begin=0, end=n_train_post_nms)
+rpn_scores = F.slice_axis(result, axis=-1, begin=0, end=1)
+rpn_bbox = F.slice_axis(result, axis=-1, begin=1, end=None)
+```

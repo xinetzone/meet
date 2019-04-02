@@ -3,7 +3,7 @@ import numpy as np
 
 class Box:
     '''
-    corner: (xmin,ymin,xmax,ymax)
+    corner: Numpy, List, Tuple, MXNet.nd, rotch.tensor
     '''
 
     def __init__(self, corner):
@@ -43,6 +43,7 @@ class Box:
         '''
         计算 bbox 的 中心坐标
         '''
+        assert isinstance(self.w, (int, float)), 'need int or float'
         xctr = self.corner[0] + (self.w - 1) * .5
         yctr = self.corner[1] + (self.h - 1) * .5
         return xctr, yctr
@@ -51,26 +52,37 @@ class Box:
         '''
         运算符：&，实现两个 box 的交集运算
         '''
-        U = np.array([self.corner, other.corner])
-        xmin, ymin, xmax, ymax = np.split(U, 4, axis=1)
-        w = xmax.min() - xmin.max()
-        h = ymax.min() - ymin.max()
-        return w * h
+        xmin = max(self.corner[0], other.corner[0])  # xmin 中的大者
+        xmax = min(self.corner[2], other.corner[2])  # xmax 中的小者
+        ymin = max(self.corner[1], other.corner[1])  # ymin 中的大者
+        ymax = min(self.corner[3], other.corner[3])  # ymax 中的小者
+        w = xmax - xmin
+        h = ymax - ymin
+        if w < 0 or h < 0: # 两个边界框没有交集
+            return 0
+        else:  
+            return w * h
 
     def __or__(self, other):
         '''
         运算符：|，实现两个 box 的并集运算
         '''
         I = self & other
-        return self.area + other.area - I
+        if I == 0:
+            return 0
+        else:
+            return self.area + other.area - I
 
     def IoU(self, other):
         '''
         计算 IoU
         '''
         I = self & other
-        U = self | other
-        return I / U
+        if I == 0:
+            return 0
+        else:
+            U = self | other
+            return I / U
 
 class MultiBox(Box):
     def __init__(self, stride, base_size, ratios, scales, alloc_size):
