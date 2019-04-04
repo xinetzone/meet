@@ -124,3 +124,50 @@ class MultiBox(Box):
             (1, -1, 4)) + offsets.reshape((-1, 1, 4)))
         anchors = anchors.reshape((1, 1, height, width, -1)).astype(np.float32)
         return anchors
+
+
+class BoxTransform(Box):
+    '''
+    一组 bbox 的运算
+    '''
+    def __init__(self, F, corners):
+        '''
+        F 可以是 mxnet.nd, numpy, torch.tensor
+        '''
+        super().__init__(corners)
+        self.corner = corners.T
+        self.F = F
+
+    def __and__(self, other):
+        r'''
+        运算符 `&` 交集运算
+        '''
+        xmin = self.F.maximum(self.corner[0].expand_dims(
+            0), other.corner[0].expand_dims(1))  # xmin 中的大者
+        xmax = self.F.minimum(self.corner[2].expand_dims(
+            0), other.corner[2].expand_dims(1))  # xmax 中的小者
+        ymin = self.F.maximum(self.corner[1].expand_dims(
+            0), other.corner[1].expand_dims(1))  # ymin 中的大者
+        ymax = self.F.minimum(self.corner[3].expand_dims(
+            0), other.corner[3].expand_dims(1))  # ymax 中的小者
+        w = xmax - xmin
+        h = ymax - ymin
+        cond = (w <= 0) + (h <= 0)
+        I = self.F.where(cond, nd.zeros_like(cond), w * h)
+        return I
+
+    def __or__(self, other):
+        r'''
+        运算符 `|` 并集运算
+        '''
+        I = self & other
+        U = self.area.expand_dims(0) + other.area.expand_dims(1) - I
+        return self.F.where(U < 0, self.F.zeros_like(I), U)
+
+    def IoU(self, other):
+        '''
+        交并比
+        '''
+        I = self & other
+        U = self | other
+        return self.F.where(U == 0, self.F.zeros_like(I), I / U)

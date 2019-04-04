@@ -915,3 +915,316 @@ result = F.slice_axis(tmp, axis=1, begin=0, end=n_train_post_nms)
 rpn_scores = F.slice_axis(result, axis=-1, begin=0, end=1)
 rpn_bbox = F.slice_axis(result, axis=-1, begin=1, end=None)
 ```
+
+上述的封装比较彻底，无法获取具体的实现，并且也不利于我们理解 NMS 的具体实现原理。为了更好的理解 NMS，自己重新实现 NMS 是十分有必要的。
+
+将 scores 按照从大到小进行排序，并返回其索引：
+
+```python
+scores = scores.flatten()  # 去除无效维度
+# 将 scores 按照从大到小进行排序，并返回其索引
+orders = scores.argsort()[:,::-1]
+```
+
+由于 loc 生成的锚框实在是太多了，为此，仅仅考虑得分前 n_train_pre_nms 的锚框：
+
+```python
+keep = orders[:,:n_train_pre_nms]
+```
+
+下面先考虑一张图片，之后再考虑多张图片一起训练的情况：
+
+```python
+order = keep[0]   # 第一张图片的得分降序索引
+score = scores[0][order]  # 第一张图片的得分预测降序排列
+roi = rois[0][order]     # 第一张图片的边界框预测按得分降序排列
+label = labels[0]     # 真实边界框
+```
+
+虽然 Box 支持 nd 作为输入，但是计算多个 IoU 效率并不高：
+
+```python
+%%timeit
+GT = [Box(corner) for corner in label]  # 真实边界框实例化
+G = [Box(corner) for corner in roi]   # 预测边界框实例化
+ious = nd.zeros((len(G), len(GT)))    #  初始化 IoU 的计算
+for i, A in enumerate(G):
+    for j, B in enumerate(GT):
+        iou = A.IoU(B)
+        ious[i, j] = iou
+```
+
+输出计时结果：
+
+```python
+1min 10s ± 6.08 s per loop (mean ± std. dev. of 7 runs, 1 loop each)
+```
+
+先转换为 Numpy 再计算 IoU 效率会更高：
+
+```python
+%%timeit
+GT = [Box(corner) for corner in label.asnumpy()]  # 真实边界框实例化
+G = [Box(corner) for corner in roi.asnumpy()]   # 预测边界框实例化
+ious = nd.zeros((len(G), len(GT)))    #  初始化 IoU 的计算
+for i, A in enumerate(G):
+    for j, B in enumerate(GT):
+        iou = A.IoU(B)
+        ious[i, j] = iou
+```
+
+输出计时结果：
+
+```python
+6.88 s ± 410 ms per loop (mean ± std. dev. of 7 runs, 1 loop each)
+```
+
+比使用 nd 快了近 10 倍！但是如果全部使用 Numpy，会有什么变化？
+
+```python
+%%timeit
+GT = [Box(corner) for corner in label.asnumpy()]  # 真实边界框实例化
+G = [Box(corner) for corner in roi.asnumpy()]   # 预测边界框实例化
+ious = np.zeros((len(G), len(GT)))    #  初始化 IoU 的计算
+for i, A in enumerate(G):
+    for j, B in enumerate(GT):
+        iou = A.IoU(B)
+        ious[i, j] = iou
+```
+
+输出计时结果：
+
+```python
+796 ms ± 30.5 ms per loop (mean ± std. dev. of 7 runs, 1 loop each)
+```
+
+速度又提升了 10 倍左右！为此，仅仅考虑使用 Numpy 来计算。将其封装进 group_ious 函数：
+
+```python
+def group_ious(pred_bbox, true_bbox):
+    # 计算 pred_bbox 与 true_bbox 的 IoU 组合
+    GT = [Box(corner) for corner in true_bbox]  # 真实边界框实例化
+    G = [Box(corner) for corner in pred_bbox]   # 预测边界框实例化
+    ious = np.zeros((len(G), len(GT)))    #  初始化 IoU 的计算
+    for i, A in enumerate(G):
+        for j, B in enumerate(GT):
+            iou = A.IoU(B)
+            ious[i, j] = iou
+    return ious
+```
+
+不过，还有更加友好的计算 ious 的方法，将会在下节介绍！
+
+### 重构代码
+
+前面的代码有点混乱，为了后续开发的便利，我们先重新整理一下代码。先仅仅考虑一张图片，下面先载入设置 RPN 网络的输入以及部分输出：
+
+```python
+# PRN 前期的设定
+channels = 256   # conv1 的输出通道数
+base_size = 2**4  # 特征图的每个像素的感受野大小
+scales = [8, 16, 32]  # 锚框相对于 reference box 的尺度
+ratios = [0.5, 1, 2]  # reference box 与锚框的高宽的比率（aspect ratios）
+stride = base_size  # 在原图上滑动的步长
+alloc_size = (128, 128)  # 一个比较大的特征图的锚框生成模板
+# 用来辅助理解 RPN 的类
+self = RPNProposal(channels, stride, base_size, ratios, scales, alloc_size)
+self.initialize()   # 初始化卷积层 conv1, loc, score
+stds = (0.1, 0.1, 0.2, 0.2)  # 偏移量的标准差
+means = (0., 0., 0., 0.)    # 偏移量的均值
+# 锚框的编码
+box_to_center = BBoxCornerToCenter()  # 将 (xmin,ymin,xmax,ymax) 转换为 (x,y,w,h)
+# 将锚框通过偏移量进行修正，并解码为 (xmin,ymin,xmax,ymax)
+box_decoder = NormalizedBoxCenterDecoder(stds, means)
+clipper = BBoxClipToImage()  # 裁剪超出原图尺寸的边界
+# 获取 COCO 的一张图片用来做实验
+img, label = loader[0]   # 获取一张图片
+img = cv2.resize(img, (800, 800))  # resize 为 (800, 800)
+imgs = nd.array(getX(img))      # 转换为 MXNet 的输入形式
+# 提取最后一层卷积的特征
+net = vgg16(pretrained=True)    # 载入基网络的权重
+features = net.features[:29]    # 卷积层特征提取器
+fs = features(imgs)  # 获取特征图张量
+A = self.anchor_generator(fs)    # 生成 (xmin,ymin,xmax,ymax) 形式的锚框
+B = box_to_center(A)      # 编码 为(x,y,w,h) 形式的锚框
+x = self.conv1(fs)    # conv1 卷积
+# sigmoid 激活之前的 score
+raw_rpn_scores = self.score(x).transpose(axes=(0, 2, 3, 1)).reshape((0, -1, 1))
+rpn_scores = nd.sigmoid(nd.stop_gradient(raw_rpn_scores))    # 激活后的 score
+# loc 预测偏移量 (tx,ty,tw,yh)
+rpn_box_pred = self.loc(x).transpose(axes=(0, 2, 3, 1)).reshape((0, -1, 4))
+# 修正锚框的坐标
+roi = box_decoder(rpn_box_pred, B)  # 解码后的预测边界框 G（RoIs）
+print(roi.shape)   # 裁剪之前
+roi = clipper(roi, imgs)  # 裁剪超出原图尺寸的边界
+```
+
+虽然，roi 已经裁剪掉超出原图尺寸的边界，但是还有一部分边界框实在有点儿小，不利于后续的训练，故而需要丢弃。丢弃的方法是将其边界框与得分均设置为 $-1$：
+
+```python
+def size_control(F, min_size, rois, scores):
+    # 拆分坐标
+    xmin, ymin, xmax, ymax = rois.split(axis=-1, num_outputs=4)
+    width = xmax - xmin  # 锚框宽度的集合
+    height = ymax - ymin  # # 锚框高度的集合
+    # 获取所有小于 min_size 的高宽
+    invalid = (width < min_size) + (height < min_size) # 同时满足条件
+    # 将不满足条件的锚框的坐标与得分均设置为 -1
+    scores = F.where(invalid, F.ones_like(invalid) * -1, scores)
+    invalid = F.repeat(invalid, axis=-1, repeats=4)
+    rois = F.where(invalid, F.ones_like(invalid) * -1, rois)
+    return rois, scores
+min_size = 16  # 最小锚框的尺寸
+pre_nms = 12000  # nms 之前的 bbox 的数目
+post_nms = 2000  # ms 之后的 bbox 的数目
+rois, scores = size_control(nd, min_size, roi, rpn_scores)
+```
+
+为了可以让 Box 一次计算多个 bbox 的 IoU，下面需要重新改写 Box：
+
+```python
+class BoxTransform(Box):
+    '''
+    一组 bbox 的运算
+    '''
+    def __init__(self, F, corners):
+        '''
+        F 可以是 mxnet.nd, numpy, torch.tensor
+        '''
+        super().__init__(corners)
+        self.corner = corners.T
+        self.F = F
+
+    def __and__(self, other):
+        r'''
+        运算符 `&` 交集运算
+        '''
+        xmin = self.F.maximum(self.corner[0].expand_dims(
+            0), other.corner[0].expand_dims(1))  # xmin 中的大者
+        xmax = self.F.minimum(self.corner[2].expand_dims(
+            0), other.corner[2].expand_dims(1))  # xmax 中的小者
+        ymin = self.F.maximum(self.corner[1].expand_dims(
+            0), other.corner[1].expand_dims(1))  # ymin 中的大者
+        ymax = self.F.minimum(self.corner[3].expand_dims(
+            0), other.corner[3].expand_dims(1))  # ymax 中的小者
+        w = xmax - xmin
+        h = ymax - ymin
+        cond = (w <= 0) + (h <= 0)
+        I = self.F.where(cond, nd.zeros_like(cond), w * h)
+        return I
+
+    def __or__(self, other):
+        r'''
+        运算符 `|` 并集运算
+        '''
+        I = self & other
+        U = self.area.expand_dims(0) + other.area.expand_dims(1) - I
+        return self.F.where(U < 0, self.F.zeros_like(I), U)
+
+    def IoU(self, other):
+        '''
+        交并比
+        '''
+        I = self & other
+        U = self | other
+        return self.F.where(U == 0, self.F.zeros_like(I), I / U)
+```
+
+我们先测试一下：
+
+```python
+a = BoxTransform(nd, nd.array([[[0, 0, 15, 15]]]))
+b = BoxTransform(nd, 1+nd.array([[[0, 0, 15, 15]]]))
+c = BoxTransform(nd, nd.array([[[-1, -1, -1, -1]]]))
+```
+
+创建了两个简单有效的 bbox（a, b） 和一个无效的 bbox（c），接着看看它们的运算：
+
+```python
+a & b, a | b, a.IoU(b)
+```
+
+输出结果：
+
+```python
+(
+ [[[196.]]] <NDArray 1x1x1 @cpu(0)>, [[[316.]]] <NDArray 1x1x1 @cpu(0)>, [[[0.62025315]]] <NDArray 1x1x1 @cpu(0)>)
+```
+
+而与无效的边界框的计算便是：
+
+```python
+a & c, a | c, a.IoU(c)
+```
+
+输出结果：
+
+```python
+(
+ [[[0.]]]
+ <NDArray 1x1x1 @cpu(0)>,
+ [[[257.]]]
+ <NDArray 1x1x1 @cpu(0)>,
+ [[[0.]]]
+ <NDArray 1x1x1 @cpu(0)>)
+```
+
+如果把无效的边界框看作是空集，则上面的运算结果便符合常识。下面讨论如何标记训练集？
+
+参考 [MSCOCO 数据标注详解](https://blog.csdn.net/wc781708249/article/details/79603522) 可以知道：COCO 的 bbox 是 (x,y,w,h) 格式的，但是这里的 (x,y) 不是中心坐标，而是左上角坐标。为了统一，需要将其转换为 (xmin,ymin,xmax,ymax) 格式：
+
+```python
+labels = nd.array(label)  # (x,y,w,h)，其中(x,y) 是左上角坐标
+cwh = (labels[:,2:4]-1) * 0.5
+labels[:,2:4] = labels[:,:2] + cwh # 转换为 (xmin,ymin,xmax,ymax)
+```
+
+下面计算真实边界框与预测边界框的 ious:
+
+```python
+# 将 scores 按照从大到小进行排序，并返回其索引
+orders = scores.reshape((0, -1)).argsort()[:, ::-1][:,:pre_nms]
+scores = scores[0][orders[0]]  # 得分降序排列
+rois = rois[0][orders[0]]  # 按得分降序排列 rois
+# 预测边界框
+G = BoxTransform(nd, rois.expand_dims(0))
+# 真实边界框
+GT = BoxTransform(nd, labels[:,:4].expand_dims(0))
+ious = G.IoU(GT).T # 计算全部的 iou
+ious.shape
+```
+
+输出结果：
+
+```python
+(1, 12000, 6)
+```
+
+可以看出，总计一张图片，预测边界框 12 000 个，真实边界框 6 个。
+
+### 标注边界框
+
+在训练阶段：NMS 直接使用 `nd.contrib.box_nms` 便可以实现，直接使用 BoxTransform 来构造 nms 的计算，暂时没有比较好的思路（还不如直接使用 for 循环来的简单，虽然它很低效）。故而，暂时先将 BoxTransform 雪藏，待到想到比较不错的点子再来考虑。
+
+编程暂且不提，这里主要讲讲如何标注训练集？上面利用 BoxTransform 已经计算出 矩阵 ious。下面就以此为基础进行 NMS 操作：
+
+1. 找出 ious 中的最大值，并定位其坐标（ious 中元素的索引），记作 $i_1,j_1$，即将 $i_1$ 分配给 $j_1$；
+2. 删除 $i_1$ 行所有元素，并删除 $j_1$ 列所有元素，此时记 ious 为 $X_1$；
+3. 找出 $X_1$ 中的最大值，并定位其坐标（ious 中元素的索引），记作 $i_2,j_2$，即将 $i_2$ 分配给 $j_2$；
+4. 删除 $i_2$ 行所有元素，并删除 $j_2$ 列所有元素，此时记 ious 为 $X_2$；
+5. 不断重复上述操作，直至删除所有列为止；
+6. 对于剩余的行，通过阈值判断是否为锚框分配真实边界框。
+
+标注训练集时不仅仅需要标注边界框的类别还要标注其相对于真实边界框的偏移量。
+
+测试集的标注与训练集不同，因为，此时没有真实边界框，所以以当前边界框的得分最大者对应的类别标签来标注类别，接着计算剩余预测框与其的 IoU 并移除与其相似的边界框。不断的重复这种操作，直至无法移除边界框为止。（MXNet 中的 contrib.ndarray.MultiBoxDetection 实现该操作。）
+
+NMS 那一节已经通过 RPN 提取出 2000 左右 Region Proposal（gluoncv 通过 RPNProposal 实现），这些 Region Proposal 作为 RoIs 当作 Fast R-CNN 的输入。
+
+## RoIHead
+
+RPN 的整个流程可以见下图：
+
+![](../images/rpn.PNG)
+
+RPN 去除了大量的重复锚框以及得分低的背景区域最后得到 2 000 左右 RoIs 送入 RoIHead 再一次调整锚框的标注信息。虽然将 2 000 个 RoIs 都作为 RoIHead 的输入是可以实现的，但是这样做会造成正负样本的不均衡问题，为此，论文提出均匀采用的策略：随机选择 256 个锚框，但要保证正负样本均衡（gluoncv 使用 ProposalTargetCreator 实现）。
