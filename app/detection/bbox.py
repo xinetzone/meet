@@ -153,7 +153,7 @@ class BoxTransform(Box):
         w = xmax - xmin
         h = ymax - ymin
         cond = (w <= 0) + (h <= 0)
-        I = self.F.where(cond, nd.zeros_like(cond), w * h)
+        I = self.F.where(cond, self.F.zeros_like(cond), w * h)
         return I
 
     def __or__(self, other):
