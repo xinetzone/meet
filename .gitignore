@@ -22,3 +22,6 @@
 *.log
 *.tlog
 *.lastbuildstate
+*.obj
+*.idb
+*.ilk
