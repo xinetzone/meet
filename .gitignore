@@ -20,5 +20,5 @@
 *.vs
 *.exe
 *.log
-*tlog
+*.tlog
 *.lastbuildstate
