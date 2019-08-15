@@ -1,21 +1,45 @@
-**/.ipynb_checkpoints
-**/__pycache__
+# compilation and distribution
+
+__pycache__
+_ext
+*.pyc
+*.so
+build/
+dist/
+
+# numpy formats
+
+*.pth
+*.pkl
+*.npy
+
+# ipython/jupyter notebooks
+
+*.ipynb
+**/*.ipynb_checkpoints/
+
+# Editor temporaries
+
+*.swn
+*.swo
+*.swp
+*~
+
+# Pycharm editor settings
+
+.idea
+
+# temp
 *.params
 *.DS_Store
 *.csv
 *egg-info*
-**/build
 *.spec
 *.h5
 *.h5c
 *.npy
-**/draft
 *.zip
-**/model
-
-**/data
 *.docx
-
 *.tmp
 *.vs
 *.exe
@@ -25,3 +49,10 @@
 *.obj
 *.idb
 *.ilk
+
+# project dirs
+
+data/
+models/
+outputs/
+draft/
